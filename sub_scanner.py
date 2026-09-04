@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-Subdomain Scanner Tool v2.0
-دمج Subfinder + Sublist3r + Assetfinder + Amass + Httpx
-مع دعم Wordlists متعددة
-"""
-
 import subprocess
 import sys
 import os
@@ -46,10 +40,9 @@ def print_banner():
     """Print beautiful banner"""
     banner = """
     ╔═══════════════════════════════════════════════════════════╗
-    ║     🚀 Subdomain Scanner Tool v2.0                       ║
-    ║     By: [Your Name]                                     ║
-    ║     Tools: Subfinder + Sublist3r + Assetfinder + Amass  ║
-    ║     Wordlist Support: Multiple files & URLs             ║
+    ║     Subdomain Scanner Tool v2.0                           ║
+    ║     By: SWIVAN017                                         ║
+    ║     Tools: Subfinder + Sublist3r + Assetfinder + Amass    ║
     ╚═══════════════════════════════════════════════════════════╝
     """
     print(banner)
