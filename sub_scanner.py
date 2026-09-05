@@ -1,1117 +1,945 @@
 #!/usr/bin/env python3
 """
-Subdomain Scanner Tool v3.0 - Professional Edition
-Advanced Multi-Threaded Subdomain Discovery with DNS + HTTP Validation
-Author: SWIVAN017
+SIATK - Subdomain Intelligence & Asset Toolkit
+Authorized security reconnaissance and subdomain enumeration aggregator
 """
 
-import subprocess
-import sys
-import os
-import re
-import socket
-import time
-import random
-import json
 import argparse
-import tempfile
-import urllib.request
-import asyncio
-import aiohttp
-import dns.resolver
-from typing import Optional, List, Set, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-import requests
+import re
+import os
+import sys
+import time
+import json
 import shutil
-import threading
-from queue import Queue
-from dataclasses import dataclass
 import signal
-import hashlib
+import tempfile
+import subprocess
+from pathlib import Path
+from datetime import datetime
+from typing import List, Set, Optional, Tuple, Dict, Any
+from dataclasses import dataclass, field
+from threading import Thread, Event
+from collections import deque
+import urllib.parse
 
-# Try to import colorama, fallback if not available
-try:
-    from colorama import init, Fore, Style
-    init(autoreset=True)
-except ImportError:
-    # Fallback if colorama not installed
-    class Fore:
-        RED = '\033[91m'
-        GREEN = '\033[92m'
-        YELLOW = '\033[93m'
-        BLUE = '\033[94m'
-        MAGENTA = '\033[95m'
-        CYAN = '\033[96m'
-        WHITE = '\033[97m'
-        RESET = '\033[0m'
-    class Style:
-        BRIGHT = '\033[1m'
-        DIM = '\033[2m'
-    def init(autoreset=True):
-        pass
+# ANSI color codes
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    RESET = '\033[0m'
+    CLEAR_LINE = '\033[2K\r'
+    UP = '\033[1A'
 
-# ===================== Configuration =====================
 @dataclass
-class ScanConfig:
-    """Configuration for the scanner"""
-    max_workers: int = 50
-    dns_timeout: int = 5
-    http_timeout: int = 8
-    retries: int = 2
-    rate_limit: int = 100
-    dns_retries: int = 3
-    use_async: bool = True
-    verbose: bool = False
-    output_dir: str = "."
-    show_progress: bool = True
+class ToolResult:
+    """Represents the result of a tool execution"""
+    tool_name: str
+    results: Set[str] = field(default_factory=set)
+    raw_output: str = ""
+    stderr: str = ""
+    status: str = "pending"  # pending, running, done, timeout, failed, skipped
+    elapsed_time: float = 0.0
+    start_time: float = 0.0
+    end_time: float = 0.0
+    timed_out: bool = False
+    exit_code: int = -1
 
-# Enhanced User Agents
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-]
+@dataclass
+class Config:
+    """Configuration for the SIATK pipeline"""
+    target: str = ""
+    wordlist: Optional[str] = None
+    threads: int = 10
+    output_mode: str = "combined"
+    time_minutes: int = 10
+    output_dir: str = ""
+    timestamp: str = ""
 
-# DNS Resolvers (multiple for reliability)
-DNS_RESOLVERS = [
-    '1.1.1.1',      # Cloudflare
-    '8.8.8.8',      # Google
-    '9.9.9.9',      # Quad9
-    '208.67.222.222', # OpenDNS
-    '1.0.0.1',      # Cloudflare Secondary
-    '8.8.4.4',      # Google Secondary
-]
-
-# Popular Wordlists URLs
-POPULAR_WORDLISTS = {
-    'seclists': 'https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt',
-    'commonspeak': 'https://raw.githubusercontent.com/assetnote/commonspeak2-wordlists/master/subdomains/subdomains.txt',
-    'chaos': 'https://raw.githubusercontent.com/chaoticag/chaos_dns_list/main/chaos_dns_list.txt',
-    'best': 'https://raw.githubusercontent.com/Proximus-Research/Wordlists/main/subdomain.txt'
-}
-
-# ==========================================================
-
-class DNSChecker:
-    """Advanced DNS checker with multiple resolvers and async support"""
+class SIATK:
+    """Main SIATK application class"""
     
-    def __init__(self, config: ScanConfig):
-        self.config = config
-        self.cache = {}
-        self.cache_lock = threading.Lock()
-        self.resolver_cache = {}
-        self.stats = {'total': 0, 'valid': 0, 'invalid': 0}
+    def __init__(self):
+        self.config = Config()
+        self.tool_results: Dict[str, ToolResult] = {}
+        self.all_hosts: Set[str] = set()
+        self.live_urls: Set[str] = set()
+        self.temp_dir: Optional[tempfile.TemporaryDirectory] = None
+        self.is_tty = sys.stdout.isatty()
+        self.running_processes: List[subprocess.Popen] = []
+        self.shutdown_event = Event()
         
-    async def check_async(self, domain: str) -> bool:
-        """Async DNS check with caching and multiple resolvers"""
-        domain = domain.lower().strip()
-        
-        # Check cache first
-        with self.cache_lock:
-            if domain in self.cache:
-                self.stats['total'] += 1
-                return self.cache[domain]
-        
-        self.stats['total'] += 1
-        
-        # Try multiple resolvers
-        for resolver_ip in DNS_RESOLVERS:
-            try:
-                # Create resolver with specific nameserver
-                resolver = dns.resolver.Resolver()
-                resolver.nameservers = [resolver_ip]
-                resolver.timeout = self.config.dns_timeout
-                resolver.lifetime = self.config.dns_timeout
-                
-                # Try A record first
-                try:
-                    answers = resolver.resolve(domain, 'A')
-                    if answers and len(answers) > 0:
-                        with self.cache_lock:
-                            self.cache[domain] = True
-                            self.stats['valid'] += 1
-                        return True
-                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout):
-                    pass
-                
-                # Try AAAA record
-                try:
-                    answers = resolver.resolve(domain, 'AAAA')
-                    if answers and len(answers) > 0:
-                        with self.cache_lock:
-                            self.cache[domain] = True
-                            self.stats['valid'] += 1
-                        return True
-                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.Timeout):
-                    pass
-                    
-            except Exception as e:
-                if self.config.verbose:
-                    print(f"{Fore.YELLOW}[DNS] Resolver {resolver_ip} failed for {domain}: {e}")
-                continue
-        
-        # All resolvers failed
-        with self.cache_lock:
-            self.cache[domain] = False
-            self.stats['invalid'] += 1
+        # ASCII Art
+        self.logo = f"""
+{Colors.CYAN}    ███████╗██╗ █████╗ ████████╗██╗  ██╗
+    ██╔════╝██║██╔══██╗╚══██╔══╝██║ ██╔╝
+    ███████╗██║███████║   ██║   █████╔╝ 
+    ╚════██║██║██╔══██║   ██║   ██╔═██╗ 
+    ███████║██║██║  ██║   ██║   ██║  ██╗
+    ╚══════╝╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝{Colors.RESET}
+{Colors.WHITE}{Colors.BOLD}    Subdomain Intelligence & Asset Toolkit{Colors.RESET}
+{Colors.DIM}    v1.0 - Authorized Security Reconnaissance Tool{Colors.RESET}
+"""
+    
+    def log(self, message: str, level: str = "INFO", color: str = Colors.WHITE):
+        """Log a message to console with timestamp"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if self.is_tty:
+            sys.stderr.write(f"{Colors.DIM}[{timestamp}]{Colors.RESET} {color}{message}{Colors.RESET}\n")
+        else:
+            sys.stderr.write(f"[{timestamp}] {message}\n")
+        sys.stderr.flush()
+
+    def print_status_line(self, message: str, clear: bool = True):
+        """Print a status line with ANSI control sequences"""
+        if self.is_tty:
+            if clear:
+                sys.stdout.write(f"{Colors.CLEAR_LINE}{message}")
+            else:
+                sys.stdout.write(f"\n{message}")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write(f"{message}\n")
+            sys.stdout.flush()
+
+    def clear_last_line(self):
+        """Clear the last line in terminal"""
+        if self.is_tty:
+            sys.stdout.write(f"{Colors.CLEAR_LINE}")
+            sys.stdout.flush()
+
+    def print_help(self):
+        """Print help information"""
+        help_text = f"""
+{Colors.BOLD}{Colors.CYAN}SYNOPSIS{Colors.RESET}
+    python3 enum.py -u <domain> [OPTIONS]
+
+{Colors.BOLD}{Colors.CYAN}REQUIRED{Colors.RESET}
+    -u, --url <domain>     Target root domain (e.g., example.com)
+
+{Colors.BOLD}{Colors.CYAN}OPTIONS{Colors.RESET}
+    -w, --wordlist <file>  Wordlist for dnscan ONLY
+    -t, --threads <num>    Number of threads (default: 10)
+    -o, --output <mode>    Output mode: combined, all (default: combined)
+    --time-minutes <num>   Maximum runtime in minutes (default: 10)
+    -h, --help            Show this help message
+
+{Colors.BOLD}{Colors.CYAN}EXAMPLES{Colors.RESET}
+    python3 enum.py -u example.com
+    python3 enum.py -u example.com -t 20
+    python3 enum.py -u example.com -w wordlist.txt
+    python3 enum.py -u example.com -o all
+    python3 enum.py -u example.com --time-minutes=5
+    python3 enum.py -u example.com -t 20 -w wordlist.txt -o all --time-minutes=5
+
+{Colors.BOLD}{Colors.CYAN}OUTPUT MODES{Colors.RESET}
+    {Colors.YELLOW}combined{Colors.RESET} (default)
+        all.txt - All unique subdomains found
+        live.txt - Live HTTP/HTTPS URLs
+        screenshots/ - Screenshots of live URLs
+
+    {Colors.YELLOW}all{Colors.RESET}
+        amass.txt, subfinder.txt, assetfinder.txt, sublist3r.txt, dnscan.txt
+        all.txt, live.txt, screenshots/
+        logs/ - Detailed execution logs
+
+{Colors.BOLD}{Colors.CYAN}TIMEOUT BEHAVIOR{Colors.RESET}
+    • Amass, Subfinder, Assetfinder, Sublist3r, dnscan, httpx use the timeout
+    • Gowitness runs WITHOUT timeout to complete screenshots naturally
+"""
+        print(help_text)
+
+    def normalize_target(self, target: str) -> str:
+        """Normalize the target domain"""
+        # Remove protocol
+        target = re.sub(r'^https?://', '', target)
+        # Remove paths, query strings, fragments
+        target = target.split('/')[0]
+        target = target.split('?')[0]
+        target = target.split('#')[0]
+        # Remove trailing dot
+        target = target.rstrip('.')
+        # Remove trailing slash
+        target = target.rstrip('/')
+        # Lowercase
+        target = target.lower()
+        return target
+
+    def validate_target(self, target: str) -> bool:
+        """Validate the target is a proper hostname"""
+        # Basic hostname validation
+        pattern = r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+        if re.match(pattern, target):
+            return True
+        # Allow subdomains with more labels
+        if re.match(r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){2,}[a-zA-Z]{2,}$', target):
+            return True
         return False
-    
-    def check_sync(self, domain: str) -> bool:
-        """Sync DNS check (fallback)"""
-        domain = domain.lower().strip()
+
+    def is_in_scope(self, hostname: str, root_domain: str) -> bool:
+        """Check if a hostname is within the target scope"""
+        hostname = hostname.lower().strip()
+        root = root_domain.lower().strip()
         
-        with self.cache_lock:
-            if domain in self.cache:
-                return self.cache[domain]
+        if not hostname or not root:
+            return False
+            
+        # Exact match
+        if hostname == root:
+            return True
+            
+        # Subdomain match
+        if hostname.endswith('.' + root):
+            return True
+            
+        return False
+
+    def extract_domains(self, text: str, root_domain: str) -> Set[str]:
+        """Extract valid in-scope domains from text"""
+        domains = set()
+        
+        # Pattern to match hostnames (including subdomains)
+        # More conservative pattern to avoid false positives
+        pattern = r'(?i)(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+(?:[a-zA-Z]{2,})'
+        
+        for match in re.finditer(pattern, text):
+            potential = match.group(0).lower()
+            
+            # Clean up potential
+            potential = potential.rstrip('.,;:!?"\'')
+            potential = potential.lstrip('.,;:!?"\'')
+            
+            # Basic validation
+            if len(potential) < 3:
+                continue
+                
+            # Check if it's in scope
+            if self.is_in_scope(potential, root_domain):
+                domains.add(potential)
+                
+        return domains
+
+    def filter_domains(self, domains: Set[str], root_domain: str) -> Set[str]:
+        """Filter domains to only include those in scope"""
+        return {d for d in domains if self.is_in_scope(d, root_domain)}
+
+    def normalize_hostname(self, hostname: str) -> str:
+        """Normalize a hostname"""
+        hostname = hostname.lower().strip()
+        # Remove surrounding quotes or brackets
+        hostname = hostname.strip('"\'. ')
+        # Remove trailing punctuation
+        hostname = hostname.rstrip('.,;:!?')
+        return hostname
+
+    def filter_live_urls(self, urls: Set[str], root_domain: str) -> Set[str]:
+        """Filter URLs to only include valid HTTP/HTTPS in-scope URLs"""
+        valid_urls = set()
+        
+        for url in urls:
+            try:
+                parsed = urllib.parse.urlparse(url)
+                
+                # Only http and https
+                if parsed.scheme not in ['http', 'https']:
+                    continue
+                    
+                # Validate hostname
+                hostname = parsed.hostname
+                if not hostname:
+                    continue
+                    
+                # Check if in scope
+                if not self.is_in_scope(hostname, root_domain):
+                    continue
+                    
+                # Reconstruct URL
+                clean_url = f"{parsed.scheme}://{parsed.hostname}"
+                if parsed.port and parsed.port not in [80, 443]:
+                    clean_url += f":{parsed.port}"
+                if parsed.path and parsed.path != '/':
+                    clean_url += parsed.path
+                    
+                valid_urls.add(clean_url)
+                
+            except Exception:
+                continue
+                
+        return valid_urls
+
+    def command_exists(self, cmd: str) -> bool:
+        """Check if a command exists in PATH"""
+        return shutil.which(cmd) is not None
+
+    def preflight_check(self) -> bool:
+        """Check all required dependencies"""
+        required_commands = ['amass', 'subfinder', 'assetfinder', 'sublist3r', 
+                           'dnscan', 'httpx', 'gowitness']
+        
+        missing = []
+        for cmd in required_commands:
+            if not self.command_exists(cmd):
+                missing.append(cmd)
+        
+        if missing:
+            self.log(f"Missing required tools: {', '.join(missing)}", "ERROR", Colors.RED)
+            self.log("Please install missing tools and try again.", "ERROR", Colors.RED)
+            return False
+        
+        return True
+
+    def build_amass_command(self, target: str, timeout_minutes: int, threads: int) -> List[str]:
+        """Build the Amass command"""
+        return [
+            'amass', 'enum',
+            '-d', target,
+            '-timeout', str(timeout_minutes),
+            '-max-dns-queries', str(max(1, threads * 2)),
+            '-o', '/dev/null'  # We capture stdout separately
+        ]
+
+    def build_subfinder_command(self, target: str, timeout_minutes: int, threads: int) -> List[str]:
+        """Build the Subfinder command"""
+        return [
+            'subfinder',
+            '-d', target,
+            '-all',
+            '-silent',
+            '-nc',
+            '-max-time', str(timeout_minutes),
+            '-t', str(min(threads, 100))  # Subfinder has a max of 100
+        ]
+
+    def build_assetfinder_command(self, target: str) -> List[str]:
+        """Build the Assetfinder command"""
+        return [
+            'assetfinder',
+            '--subs-only',
+            target
+        ]
+
+    def build_sublist3r_command(self, target: str, threads: int) -> List[str]:
+        """Build the Sublist3r command"""
+        return [
+            'sublist3r',
+            '-d', target,
+            '-t', str(min(threads, 50)),  # Sublist3r has threading limitations
+            '-v'  # Verbose to get output we can parse
+        ]
+
+    def build_dnscan_command(self, target: str, wordlist: str, threads: int) -> List[str]:
+        """Build the dnscan command"""
+        # dnscan uses -d for domain and -w for wordlist
+        # Clamp threads to safe maximum for dnscan
+        safe_threads = min(threads, 20)
+        return [
+            'dnscan',
+            '-d', target,
+            '-w', wordlist,
+            '-t', str(safe_threads)
+        ]
+
+    def build_httpx_command(self, target_file: str, threads: int, timeout_minutes: int) -> List[str]:
+        """Build the httpx command"""
+        # Convert minutes to seconds for httpx
+        timeout_seconds = timeout_minutes * 60
+        return [
+            'httpx',
+            '-l', target_file,
+            '-silent',
+            '-fr',
+            '-t', str(threads),
+            '-timeout', str(timeout_seconds),
+            '-retries', '2',
+            '-nc'
+        ]
+
+    def build_gowitness_command(self, url_file: str, threads: int) -> List[str]:
+        """Build the Gowitness command"""
+        return [
+            'gowitness',
+            'scan',
+            'file',
+            '-f', url_file,
+            '--screenshot-path', 'screenshots/',
+            '--threads', str(min(threads, 20))
+        ]
+
+    def run_tool(self, tool_name: str, cmd: List[str], timeout_seconds: Optional[int] = None, 
+                 capture_output: bool = True) -> ToolResult:
+        """Run a tool with timeout support"""
+        result = ToolResult(tool_name=tool_name)
+        result.status = "running"
+        result.start_time = time.time()
+        
+        stdout_file = None
+        stderr_file = None
+        process = None
         
         try:
-            socket.gethostbyname(domain)
-            with self.cache_lock:
-                self.cache[domain] = True
-                self.stats['valid'] += 1
-            return True
-        except socket.gaierror:
-            with self.cache_lock:
-                self.cache[domain] = False
-                self.stats['invalid'] += 1
-            return False
-    
-    def get_stats(self) -> Dict:
-        """Get DNS statistics"""
-        return self.stats
+            if capture_output:
+                # Use temporary files for stdout/stderr
+                stdout_file = tempfile.NamedTemporaryFile(mode='w+', delete=False)
+                stderr_file = tempfile.NamedTemporaryFile(mode='w+', delete=False)
+                
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                    text=True
+                )
+            else:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    text=True
+                )
+            
+            self.running_processes.append(process)
+            
+            # Wait for process with timeout
+            start_time = time.time()
+            while True:
+                if self.shutdown_event.is_set():
+                    self.kill_process_group(process)
+                    break
+                    
+                try:
+                    if timeout_seconds is not None:
+                        elapsed = time.time() - start_time
+                        if elapsed >= timeout_seconds:
+                            self.kill_process_group(process)
+                            result.timed_out = True
+                            result.status = "timeout"
+                            break
+                    
+                    # Check if process has finished
+                    if process.poll() is not None:
+                        break
+                        
+                    # Update elapsed time
+                    result.elapsed_time = time.time() - result.start_time
+                    time.sleep(0.1)
+                    
+                except Exception:
+                    break
+            
+            # Wait for process to finish
+            try:
+                result.exit_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.kill_process_group(process)
+                result.exit_code = process.wait()
+            
+            # Read output from temporary files
+            if capture_output and stdout_file:
+                stdout_file.flush()
+                stdout_file.close()
+                with open(stdout_file.name, 'r') as f:
+                    result.raw_output = f.read()
+                os.unlink(stdout_file.name)
+                
+            if capture_output and stderr_file:
+                stderr_file.flush()
+                stderr_file.close()
+                with open(stderr_file.name, 'r') as f:
+                    result.stderr = f.read()
+                os.unlink(stderr_file.name)
+            elif not capture_output and process:
+                stdout, stderr = process.communicate()
+                result.raw_output = stdout
+                result.stderr = stderr
+            
+            result.elapsed_time = time.time() - result.start_time
+            result.end_time = time.time()
+            
+            if not result.timed_out and result.exit_code == 0:
+                result.status = "done"
+                
+        except FileNotFoundError:
+            result.status = "failed"
+            result.exit_code = -1
+            self.log(f"Command not found: {cmd[0]}", "ERROR", Colors.RED)
+        except Exception as e:
+            result.status = "failed"
+            result.exit_code = -1
+            self.log(f"Error running {tool_name}: {str(e)}", "ERROR", Colors.RED)
+        finally:
+            if process and process in self.running_processes:
+                self.running_processes.remove(process)
+            if stdout_file and os.path.exists(stdout_file.name):
+                try:
+                    os.unlink(stdout_file.name)
+                except:
+                    pass
+            if stderr_file and os.path.exists(stderr_file.name):
+                try:
+                    os.unlink(stderr_file.name)
+                except:
+                    pass
+                
+        return result
 
-class SubdomainScanner:
-    """Main scanner class with advanced features"""
-    
-    def __init__(self, domain: str, config: ScanConfig):
-        self.domain = domain.lower().strip()
-        self.config = config
-        self.dns_checker = DNSChecker(config)
-        self.results = {
-            'all_subdomains': set(),
-            'valid_dns': set(),
-            'http_results': [],
-            'stats': {
-                'tools': {},
-                'dns': {},
-                'http': {}
-            }
-        }
-        self.start_time = time.time()
-        
-    def print_progress(self, current: int, total: int, message: str = ""):
-        """Print progress bar"""
-        if not self.config.show_progress:
+    def kill_process_group(self, process: subprocess.Popen):
+        """Kill an entire process group"""
+        if process is None:
             return
             
-        if total > 0:
-            percent = (current / total) * 100 if total > 0 else 0
-            bar_length = 40
-            filled = int(bar_length * current / total)
-            bar = '█' * filled + '░' * (bar_length - filled)
-            sys.stdout.write(f'\r[{bar}] {percent:5.1f}% - {message}')
-            sys.stdout.flush()
-    
-    def _run_subfinder(self) -> List[str]:
-        """Run Subfinder with advanced options"""
-        print(f"{Fore.CYAN}[+] Running Subfinder...")
-        subdomains = []
         try:
-            cmd = ["subfinder", "-d", self.domain, "-all", "-silent"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-            subdomains = [line.strip().lower() for line in result.stdout.split('\n') if line.strip()]
-            print(f"{Fore.GREEN}✓ Subfinder: {len(subdomains)} subdomains")
-            self.results['stats']['tools']['subfinder'] = len(subdomains)
-            return subdomains
-        except subprocess.TimeoutExpired:
-            print(f"{Fore.YELLOW}⚠ Subfinder timed out")
-            return []
-        except Exception as e:
-            if self.config.verbose:
-                print(f"{Fore.RED}✗ Subfinder error: {e}")
-            return []
-    
-    def _run_sublist3r(self) -> List[str]:
-        """Run Sublist3r"""
-        print(f"{Fore.CYAN}[+] Running Sublist3r...")
-        subdomains = []
-        try:
-            import sublist3r
-            subdomains = sublist3r.main(self.domain, 50, savefile=None, ports=None, 
-                                       silent=True, verbose=False, enable_bruteforce=False, engines=None)
-            subdomains = [s.lower() for s in subdomains]
-            print(f"{Fore.GREEN}✓ Sublist3r: {len(subdomains)} subdomains")
-            self.results['stats']['tools']['sublist3r'] = len(subdomains)
-            return subdomains
-        except ImportError:
-            print(f"{Fore.YELLOW}⚠ Sublist3r not installed, skipping...")
-            return []
-        except Exception as e:
-            if self.config.verbose:
-                print(f"{Fore.RED}✗ Sublist3r error: {e}")
-            return []
-    
-    def _run_assetfinder(self) -> List[str]:
-        """Run Assetfinder"""
-        print(f"{Fore.CYAN}[+] Running Assetfinder...")
-        subdomains = []
-        try:
-            cmd = ["assetfinder", "--subs-only", self.domain]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            subdomains = [line.strip().lower() for line in result.stdout.split('\n') if line.strip()]
-            print(f"{Fore.GREEN}✓ Assetfinder: {len(subdomains)} subdomains")
-            self.results['stats']['tools']['assetfinder'] = len(subdomains)
-            return subdomains
-        except Exception as e:
-            if self.config.verbose:
-                print(f"{Fore.RED}✗ Assetfinder error: {e}")
-            return []
-    
-    def run_amass_enhanced(self, wordlist_path: str = None) -> List[str]:
-        """Enhanced Amass with better control and multiple modes"""
-        print(f"{Fore.CYAN}[+] Running Amass...")
-        all_subdomains = []
-        
-        # Different Amass modes
-        modes = []
-        
-        # 1. Passive mode (always)
-        modes.append(("passive", ["amass", "enum", "-passive", "-d", self.domain, "-nocolor"]))
-        
-        # 2. Brute force (if wordlist exists)
-        if wordlist_path and os.path.exists(wordlist_path):
-            modes.append(("bruteforce", ["amass", "enum", "-brute", "-d", self.domain, 
-                                        "-w", wordlist_path, "-nocolor", "-timeout", "30"]))
+            # Send SIGTERM to process group
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            # Give it a moment to terminate gracefully
+            time.sleep(1)
             
-            # 3. Active mode (more aggressive)
-            modes.append(("active", ["amass", "enum", "-active", "-d", self.domain, 
-                                    "-w", wordlist_path, "-nocolor", "-timeout", "30"]))
-        
-        for mode_name, cmd in modes:
-            try:
-                if self.config.verbose:
-                    print(f"{Fore.YELLOW}   Running Amass {mode_name} mode...")
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                
-                if result.stdout:
-                    found = [line.strip() for line in result.stdout.split('\n') if line.strip()]
-                    # Filter out non-domain lines
-                    found = [s for s in found if '.' in s and not s.startswith(('(', '['))]
-                    all_subdomains.extend(found)
-                    print(f"{Fore.GREEN}   ✓ Amass {mode_name}: {len(found)} subdomains")
-                
-            except subprocess.TimeoutExpired:
-                print(f"{Fore.YELLOW}   ⚠ Amass {mode_name} timed out")
-            except Exception as e:
-                if self.config.verbose:
-                    print(f"{Fore.RED}   ✗ Amass {mode_name} error: {e}")
-        
-        # Deduplicate
-        unique = list(set([s.lower() for s in all_subdomains]))
-        print(f"{Fore.GREEN}✓ Amass total: {len(unique)} unique subdomains")
-        self.results['stats']['tools']['amass'] = len(unique)
-        return unique
-    
-    def filter_subdomains(self, raw_subdomains: List[str]) -> Set[str]:
-        """Advanced filtering of subdomains"""
-        filtered = set()
-        
-        # Patterns
-        ip_pattern = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
-        cidr_pattern = re.compile(r'/\d{1,2}$')
-        number_only = re.compile(r'^\d+$')
-        wildcard_pattern = re.compile(r'^\*\.')
-        domain_pattern = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9-.]+\.[a-zA-Z]{2,}$')
-        
-        for sub in raw_subdomains:
-            sub = sub.strip().lower()
+            # If still running, send SIGKILL
+            if process.poll() is None:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                time.sleep(0.5)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+
+    def update_status_display(self, step: int, total_steps: int, tool_name: str, 
+                             result: ToolResult, status_message: str = ""):
+        """Update the status display with current progress"""
+        if not self.is_tty:
+            return
             
-            # Skip empty
-            if not sub:
-                continue
-            
-            # Skip IPs
-            if ip_pattern.match(sub):
-                continue
-            
-            # Skip CIDR
-            if cidr_pattern.search(sub):
-                continue
-            
-            # Skip numbers only
-            if number_only.match(sub):
-                continue
-            
-            # Skip wildcards
-            if wildcard_pattern.match(sub):
-                continue
-            
-            # Skip if not valid domain format
-            if not domain_pattern.match(sub):
-                continue
-            
-            # Skip if domain not in subdomain
-            if self.domain not in sub:
-                continue
-            
-            # Clean domain
-            if sub.endswith('.'):
-                sub = sub[:-1]
-            
-            # Remove protocol if exists
-            if sub.startswith(('http://', 'https://')):
-                sub = sub.split('//')[1].split('/')[0]
-            
-            filtered.add(sub)
+        status_lines = []
         
-        return filtered
-    
-    def get_subdomain_stats(self, subdomains: Set[str]) -> Dict:
-        """Get statistics about subdomains"""
-        stats = {
-            'total': len(subdomains),
-            'with_hyphen': len([s for s in subdomains if '-' in s]),
-            'with_number': len([s for s in subdomains if any(c.isdigit() for c in s)]),
-            'length_distribution': {
-                'short': len([s for s in subdomains if len(s) < 10]),
-                'medium': len([s for s in subdomains if 10 <= len(s) < 20]),
-                'long': len([s for s in subdomains if len(s) >= 20])
-            }
-        }
-        return stats
-    
-    async def validate_dns_batch(self, subdomains: List[str]) -> Set[str]:
-        """Batch DNS validation with async"""
-        print(f"{Fore.CYAN}[+] Validating DNS for {len(subdomains)} subdomains...")
-        
-        valid = set()
-        total = len(subdomains)
-        
-        # Process in batches
-        batch_size = 100
-        for i in range(0, total, batch_size):
-            batch = subdomains[i:i+batch_size]
-            tasks = [self.dns_checker.check_async(domain) for domain in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Main status header
+        if step <= total_steps:
+            status_lines.append(f"{Colors.BOLD}{Colors.CYAN}[{step}/{total_steps}] {tool_name}{Colors.RESET}")
             
-            for domain, result in zip(batch, results):
-                if isinstance(result, bool) and result:
-                    valid.add(domain)
-                elif isinstance(result, Exception) and self.config.verbose:
-                    print(f"{Fore.RED}✗ Error checking {domain}: {result}")
-            
-            # Progress
-            progress = min(i + batch_size, total)
-            self.print_progress(progress, total, f"DNS validation ({len(valid)} valid)")
-            
-            # Rate limiting
-            if i + batch_size < total:
-                await asyncio.sleep(0.3)
-        
-        print()  # New line after progress bar
-        print(f"{Fore.GREEN}✓ {len(valid)} valid DNS records found")
-        self.results['stats']['dns'] = self.dns_checker.get_stats()
-        return valid
-    
-    async def check_http_async(self, domains: List[str]) -> List[Dict]:
-        """Advanced HTTP checking with async"""
-        print(f"{Fore.CYAN}[+] Checking HTTP/HTTPS for {len(domains)} domains...")
-        
-        if not domains:
-            return []
-        
-        results = []
-        semaphore = asyncio.Semaphore(self.config.max_workers)
-        failed = 0
-        
-        async def check_single(domain: str):
-            async with semaphore:
-                return await self._check_http_domain(domain)
-        
-        tasks = [check_single(domain) for domain in domains]
-        http_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in http_results:
-            if isinstance(result, dict):
-                results.append(result)
-            elif isinstance(result, Exception):
-                failed += 1
-                if self.config.verbose:
-                    print(f"{Fore.RED}✗ HTTP error: {str(result)[:50]}")
-        
-        print(f"{Fore.GREEN}✓ HTTP results: {len(results)} success, {failed} failed")
-        self.results['stats']['http'] = {'total': len(domains), 'success': len(results), 'failed': failed}
-        return results
-    
-    async def _check_http_domain(self, domain: str) -> Optional[Dict]:
-        """Check single domain HTTP/HTTPS"""
-        protocols = ['https://', 'http://']
-        
-        for proto in protocols:
-            url = f"{proto}{domain}"
-            
-            for attempt in range(self.config.retries):
-                try:
-                    timeout = aiohttp.ClientTimeout(total=self.config.http_timeout)
-                    connector = aiohttp.TCPConnector(ssl=False)
+            if result:
+                if result.status == "running":
+                    elapsed = time.time() - result.start_time
+                    elapsed_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+                    timeout_str = f"{self.config.time_minutes}m"
+                    results_count = len(result.results)
+                    status_lines.append(f"  {Colors.YELLOW}├─ Status:{Colors.RESET} {Colors.GREEN}RUNNING{Colors.RESET}")
+                    status_lines.append(f"  {Colors.YELLOW}├─ Elapsed:{Colors.RESET} {elapsed_str}")
+                    status_lines.append(f"  {Colors.YELLOW}├─ Results:{Colors.RESET} {results_count}")
+                    status_lines.append(f"  {Colors.YELLOW}└─ Timeout:{Colors.RESET} {timeout_str}")
                     
-                    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                        headers = {
-                            'User-Agent': random.choice(USER_AGENTS),
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                            'Accept-Language': 'en-US,en;q=0.5',
-                            'Accept-Encoding': 'gzip, deflate',
-                            'Connection': 'keep-alive',
-                            'Upgrade-Insecure-Requests': '1',
-                        }
-                        
-                        async with session.get(url, headers=headers, allow_redirects=True) as resp:
-                            # Get response details
-                            status_code = resp.status
-                            content_type = resp.headers.get('Content-Type', '')
-                            server = resp.headers.get('Server', '')
-                            content_length = resp.headers.get('Content-Length', '0')
-                            
-                            # Get title (if HTML)
-                            title = ''
-                            if 'text/html' in content_type.lower():
-                                try:
-                                    html = await resp.text()
-                                    title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-                                    if title_match:
-                                        title = title_match.group(1).strip()
-                                except:
-                                    pass
-                            
-                            # Detect technologies
-                            techs = self._detect_tech(resp.headers, content_type)
-                            
-                            return {
-                                'url': url,
-                                'domain': domain,
-                                'status_code': status_code,
-                                'title': title[:100],
-                                'content_type': content_type,
-                                'server': server,
-                                'content_length': content_length,
-                                'tech': techs,
-                                'redirects': len(resp.history),
-                                'final_url': str(resp.url),
-                                'is_active': 200 <= status_code < 400,
-                                'response_time': 0,  # Would need more complex timing
-                            }
-                            
-                except asyncio.TimeoutError:
-                    if attempt < self.config.retries - 1:
-                        await asyncio.sleep(0.5)
-                    continue
-                except Exception as e:
-                    if attempt < self.config.retries - 1:
-                        await asyncio.sleep(0.5)
-                    continue
+                elif result.status == "done":
+                    status_lines.append(f"  {Colors.YELLOW}└─{Colors.RESET} {Colors.GREEN}DONE{Colors.RESET} — {len(result.results)} results")
+                    
+                elif result.status == "timeout":
+                    status_lines.append(f"  {Colors.YELLOW}└─{Colors.RESET} {Colors.RED}TIMEOUT{Colors.RESET} — {len(result.results)} results preserved")
+                    
+                elif result.status == "failed":
+                    status_lines.append(f"  {Colors.YELLOW}└─{Colors.RESET} {Colors.RED}FAILED{Colors.RESET}")
+                    
+                elif result.status == "skipped":
+                    status_lines.append(f"  {Colors.YELLOW}└─{Colors.RESET} {Colors.DIM}SKIPPED{Colors.RESET}")
         
-        return None
-    
-    def _detect_tech(self, headers: dict, content_type: str) -> List[str]:
-        """Detect technologies from headers"""
-        techs = []
+        # Clear previous status lines and print new ones
+        # Move up to start of status block
+        lines_to_clear = len(self._last_status_lines) if hasattr(self, '_last_status_lines') else 0
+        for _ in range(lines_to_clear):
+            sys.stdout.write(f"{Colors.UP}{Colors.CLEAR_LINE}")
         
-        server = headers.get('Server', '').lower()
-        if 'nginx' in server:
-            techs.append('nginx')
-        elif 'apache' in server:
-            techs.append('apache')
-        elif 'cloudflare' in server or 'cf-ray' in headers:
-            techs.append('cloudflare')
-        elif 'aws' in server or 'amazon' in server:
-            techs.append('aws')
-        elif 'microsoft-iis' in server:
-            techs.append('iis')
+        # Print new status
+        for line in status_lines:
+            sys.stdout.write(f"{line}\n")
         
-        if 'x-powered-by' in headers:
-            xpb = headers['x-powered-by'].lower()
-            if 'php' in xpb:
-                techs.append('php')
-            if 'express' in xpb or 'node' in xpb:
-                techs.append('node.js')
-            if 'asp.net' in xpb:
-                techs.append('asp.net')
+        sys.stdout.flush()
+        self._last_status_lines = status_lines
+
+    def write_clean_results(self, results: Set[str], filename: str):
+        """Write clean results to a file"""
+        sorted_results = sorted(results)
+        with open(filename, 'w') as f:
+            for item in sorted_results:
+                f.write(f"{item}\n")
+
+    def run_pipeline(self):
+        """Run the complete enumeration pipeline"""
+        target = self.config.target
+        output_dir = self.config.output_dir
+        output_mode = self.config.output_mode
+        threads = self.config.threads
+        time_minutes = self.config.time_minutes
         
-        if 'wordpress' in server or 'wp-' in server:
-            techs.append('wordpress')
+        # Create directories
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        Path(os.path.join(output_dir, 'screenshots')).mkdir(exist_ok=True)
         
-        if 'django' in server:
-            techs.append('django')
+        if output_mode == 'all':
+            Path(os.path.join(output_dir, 'logs')).mkdir(exist_ok=True)
         
-        if 'rails' in server:
-            techs.append('rails')
+        # Initialize results
+        all_hosts = set()
+        tool_results = {}
         
-        if 'gunicorn' in server:
-            techs.append('gunicorn')
+        # Define tools to run
+        tools = [
+            ('Amass', 'amass'),
+            ('Subfinder', 'subfinder'),
+            ('Assetfinder', 'assetfinder'),
+            ('Sublist3r', 'sublist3r'),
+            ('dnscan', 'dnscan')
+        ]
         
-        # Detect frameworks from headers
-        if 'x-frame-options' in headers:
-            techs.append('security_headers')
+        total_steps = len(tools) + 2  # +2 for httpx and gowitness
         
-        return techs
-    
-    def _check_http_sync(self, domains: List[str]) -> List[Dict]:
-        """Sync HTTP check (fallback)"""
-        results = []
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-            future_to_domain = {executor.submit(self._check_http_sync_single, domain): domain 
-                               for domain in domains}
-            for future in as_completed(future_to_domain):
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    if self.config.verbose:
-                        print(f"{Fore.RED}✗ HTTP sync error: {e}")
-        return results
-    
-    def _check_http_sync_single(self, domain: str) -> Optional[Dict]:
-        """Single HTTP check sync"""
-        protocols = ['https://', 'http://']
-        for proto in protocols:
-            url = f"{proto}{domain}"
-            try:
-                resp = requests.get(url, timeout=self.config.http_timeout, 
-                                  headers={'User-Agent': random.choice(USER_AGENTS)},
-                                  allow_redirects=True, verify=False)
-                return {
-                    'url': url,
-                    'domain': domain,
-                    'status_code': resp.status_code,
-                    'title': '',
-                    'is_active': 200 <= resp.status_code < 400,
-                    'server': resp.headers.get('Server', ''),
-                    'content_length': resp.headers.get('Content-Length', '0'),
-                    'tech': [],
-                    'redirects': len(resp.history)
-                }
-            except:
-                continue
-        return None
-    
-    def _save_enhanced_results(self, results: List[Dict]):
-        """Save enhanced results to multiple files"""
+        # Display logo
+        if self.is_tty:
+            print(self.logo)
+            print(f"{Colors.DIM}Target: {Colors.WHITE}{target}{Colors.RESET}")
+            print(f"{Colors.DIM}Output: {Colors.WHITE}{output_dir}{Colors.RESET}")
+            print(f"{Colors.DIM}Timeout:{Colors.RESET} {time_minutes}m")
+            print("")
         
-        # Save detailed results
-        with open(os.path.join(self.config.output_dir, "final.txt"), 'w', encoding='utf-8') as f:
-            f.write("="*80 + "\n")
-            f.write(f"SUBDOMAIN SCAN RESULTS - DETAILED\n")
-            f.write(f"Target: {self.domain}\n")
-            f.write(f"Scan Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*80 + "\n\n")
+        # Step 1: Amass
+        step = 1
+        result = ToolResult(tool_name='Amass')
+        
+        self.log(f"Starting Amass enumeration...", "INFO", Colors.CYAN)
+        self.update_status_display(step, total_steps, 'AMASS', result)
+        
+        cmd = self.build_amass_command(target, time_minutes, threads)
+        result = self.run_tool('Amass', cmd, timeout_seconds=time_minutes * 60)
+        
+        # Extract domains from raw output
+        if result.raw_output:
+            domains = self.extract_domains(result.raw_output, target)
+            result.results = self.filter_domains(domains, target)
+            all_hosts.update(result.results)
+        
+        tool_results['Amass'] = result
+        self.update_status_display(step, total_steps, 'AMASS', result)
+        
+        # Step 2: Subfinder
+        step = 2
+        result = ToolResult(tool_name='Subfinder')
+        
+        self.log(f"Starting Subfinder enumeration...", "INFO", Colors.CYAN)
+        self.update_status_display(step, total_steps, 'SUBFINDER', result)
+        
+        cmd = self.build_subfinder_command(target, time_minutes, threads)
+        result = self.run_tool('Subfinder', cmd, timeout_seconds=time_minutes * 60)
+        
+        if result.raw_output:
+            domains = self.extract_domains(result.raw_output, target)
+            result.results = self.filter_domains(domains, target)
+            all_hosts.update(result.results)
+        
+        tool_results['Subfinder'] = result
+        self.update_status_display(step, total_steps, 'SUBFINDER', result)
+        
+        # Step 3: Assetfinder
+        step = 3
+        result = ToolResult(tool_name='Assetfinder')
+        
+        self.log(f"Starting Assetfinder enumeration...", "INFO", Colors.CYAN)
+        self.update_status_display(step, total_steps, 'ASSETFINDER', result)
+        
+        cmd = self.build_assetfinder_command(target)
+        result = self.run_tool('Assetfinder', cmd, timeout_seconds=time_minutes * 60)
+        
+        if result.raw_output:
+            domains = self.extract_domains(result.raw_output, target)
+            result.results = self.filter_domains(domains, target)
+            all_hosts.update(result.results)
+        
+        tool_results['Assetfinder'] = result
+        self.update_status_display(step, total_steps, 'ASSETFINDER', result)
+        
+        # Step 4: Sublist3r
+        step = 4
+        result = ToolResult(tool_name='Sublist3r')
+        
+        self.log(f"Starting Sublist3r enumeration...", "INFO", Colors.CYAN)
+        self.update_status_display(step, total_steps, 'SUBLIST3R', result)
+        
+        cmd = self.build_sublist3r_command(target, threads)
+        result = self.run_tool('Sublist3r', cmd, timeout_seconds=time_minutes * 60)
+        
+        if result.raw_output:
+            domains = self.extract_domains(result.raw_output, target)
+            result.results = self.filter_domains(domains, target)
+            all_hosts.update(result.results)
+        
+        tool_results['Sublist3r'] = result
+        self.update_status_display(step, total_steps, 'SUBLIST3R', result)
+        
+        # Step 5: dnscan
+        step = 5
+        result = ToolResult(tool_name='dnscan')
+        
+        if self.config.wordlist and os.path.exists(self.config.wordlist):
+            self.log(f"Starting dnscan enumeration with wordlist...", "INFO", Colors.CYAN)
+            self.update_status_display(step, total_steps, 'DNSCAN', result)
             
-            # Sort by status code
-            results.sort(key=lambda x: x.get('status_code', 0), reverse=True)
+            cmd = self.build_dnscan_command(target, self.config.wordlist, threads)
+            result = self.run_tool('dnscan', cmd, timeout_seconds=time_minutes * 60)
             
-            active_count = 0
-            for r in results:
-                status = r.get('status_code', 'N/A')
-                if 200 <= status < 400:
-                    active_count += 1
-                    status_str = f"✅ {status}"
-                elif 400 <= status < 500:
-                    status_str = f"⚠️ {status}"
-                elif status >= 500:
-                    status_str = f"❌ {status}"
-                else:
-                    status_str = f"❓ {status}"
-                
-                f.write(f"🌐 {r.get('url', 'N/A')}\n")
-                f.write(f"   Status: {status_str}\n")
-                f.write(f"   Title: {r.get('title', 'No Title')[:100]}\n")
-                f.write(f"   Server: {r.get('server', 'Unknown')}\n")
-                f.write(f"   Content-Type: {r.get('content_type', 'Unknown')}\n")
-                f.write(f"   Tech Stack: {', '.join(r.get('tech', [])) or 'Unknown'}\n")
-                f.write(f"   Redirects: {r.get('redirects', 0)}\n")
-                f.write(f"   Final URL: {r.get('final_url', r.get('url', 'N/A'))}\n")
-                f.write("-"*80 + "\n")
-            
-            # Summary
-            f.write(f"\n📊 SUMMARY:\n")
-            f.write(f"   Total tested: {len(results)}\n")
-            f.write(f"   Active (200-399): {active_count}\n")
-            f.write(f"   Redirects: {len([r for r in results if r.get('redirects', 0) > 0])}\n")
-            f.write(f"   Tech detected: {len(set().union(*[set(r.get('tech', [])) for r in results]))}\n")
-        
-        # Save active only
-        with open(os.path.join(self.config.output_dir, "active.txt"), 'w', encoding='utf-8') as f:
-            for r in results:
-                if r.get('is_active', False):
-                    f.write(f"{r.get('url', '')}\n")
-                    if r.get('title'):
-                        f.write(f"  Title: {r['title'][:100]}\n")
-        
-        # Save JSON format for automation
-        with open(os.path.join(self.config.output_dir, "results.json"), 'w', encoding='utf-8') as f:
-            json.dump({
-                'target': self.domain,
-                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'stats': self.results['stats'],
-                'results': results
-            }, f, indent=2, default=str)
-        
-        print(f"{Fore.GREEN}✓ Detailed results saved to final.txt")
-        print(f"{Fore.GREEN}✓ Active URLs saved to active.txt")
-        print(f"{Fore.GREEN}✓ JSON results saved to results.json")
-    
-    async def run_full_scan(self, wordlist_path: str = None):
-        """Run full scan with all features"""
-        print(f"{Fore.CYAN}{'='*60}")
-        print(f"{Fore.CYAN}🚀 SCANNING: {self.domain}")
-        print(f"{Fore.CYAN}{'='*60}")
-        print(f"{Fore.CYAN}Configuration:")
-        print(f"  Max Workers: {self.config.max_workers}")
-        print(f"  Async: {'Enabled' if self.config.use_async else 'Disabled'}")
-        print(f"  DNS Timeout: {self.config.dns_timeout}s")
-        print(f"  HTTP Timeout: {self.config.http_timeout}s")
-        print(f"{Fore.CYAN}{'='*60}")
-        
-        # Phase 1: Collect subdomains from all tools
-        print(f"\n{Fore.YELLOW}[📡] Phase 1: Collecting subdomains...")
-        print(f"{Fore.YELLOW}{'-'*40}")
-        all_raw = []
-        
-        # Run tools
-        tools_results = {}
-        
-        # Subfinder
-        tools_results['Subfinder'] = self._run_subfinder()
-        all_raw.extend(tools_results['Subfinder'])
-        
-        # Sublist3r
-        tools_results['Sublist3r'] = self._run_sublist3r()
-        all_raw.extend(tools_results['Sublist3r'])
-        
-        # Assetfinder
-        tools_results['Assetfinder'] = self._run_assetfinder()
-        all_raw.extend(tools_results['Assetfinder'])
-        
-        # Amass
-        tools_results['Amass'] = self.run_amass_enhanced(wordlist_path)
-        all_raw.extend(tools_results['Amass'])
-        
-        # Filter subdomains
-        self.results['all_subdomains'] = self.filter_subdomains(all_raw)
-        
-        # Show statistics
-        print(f"\n{Fore.GREEN}📊 Collection Summary:")
-        for tool, subs in tools_results.items():
-            print(f"   {tool}: {len(subs)}")
-        print(f"{Fore.GREEN}   Total unique: {len(self.results['all_subdomains'])}")
-        
-        # Get detailed stats
-        stats = self.get_subdomain_stats(self.results['all_subdomains'])
-        print(f"\n{Fore.CYAN}📈 Subdomain Statistics:")
-        print(f"   Total: {stats['total']}")
-        print(f"   With hyphen: {stats['with_hyphen']}")
-        print(f"   With numbers: {stats['with_number']}")
-        print(f"   Short (<10 chars): {stats['length_distribution']['short']}")
-        print(f"   Medium (10-19 chars): {stats['length_distribution']['medium']}")
-        print(f"   Long (20+ chars): {stats['length_distribution']['long']}")
-        
-        if len(self.results['all_subdomains']) == 0:
-            print(f"{Fore.RED}✗ No subdomains found. Exiting.")
-            sys.exit(1)
-        
-        # Phase 2: Validate DNS
-        print(f"\n{Fore.YELLOW}[🔍] Phase 2: Validating DNS...")
-        print(f"{Fore.YELLOW}{'-'*40}")
-        if self.config.use_async:
-            self.results['valid_dns'] = await self.validate_dns_batch(list(self.results['all_subdomains']))
+            if result.raw_output:
+                domains = self.extract_domains(result.raw_output, target)
+                result.results = self.filter_domains(domains, target)
+                all_hosts.update(result.results)
         else:
-            # Sync fallback
-            print(f"{Fore.YELLOW}Using sync DNS validation...")
-            valid = set()
-            total = len(self.results['all_subdomains'])
-            for i, sub in enumerate(self.results['all_subdomains']):
-                if self.dns_checker.check_sync(sub):
-                    valid.add(sub)
-                self.print_progress(i+1, total, f"DNS validation ({len(valid)} valid)")
-            print()
-            self.results['valid_dns'] = valid
-            print(f"{Fore.GREEN}✓ {len(valid)} valid DNS records found")
+            result.status = "skipped"
+            self.log(f"dnscan skipped - no wordlist provided", "INFO", Colors.YELLOW)
+            
+        tool_results['dnscan'] = result
+        self.update_status_display(step, total_steps, 'DNSCAN', result)
         
-        # Phase 3: Save all subs
-        print(f"\n{Fore.YELLOW}[💾] Phase 3: Saving results...")
-        with open(os.path.join(self.config.output_dir, "subs.txt"), 'w', encoding='utf-8') as f:
-            for sub in sorted(self.results['all_subdomains']):
-                f.write(sub + '\n')
-        print(f"{Fore.GREEN}✓ All subdomains saved to subs.txt ({len(self.results['all_subdomains'])})")
+        # Step 6: Save all.txt
+        step = 6
+        self.log(f"Combining and deduplicating all results...", "INFO", Colors.CYAN)
         
-        # Phase 4: HTTP check
-        if self.results['valid_dns']:
-            print(f"\n{Fore.YELLOW}[🌐] Phase 4: HTTP/HTTPS validation...")
-            print(f"{Fore.YELLOW}{'-'*40}")
+        # Global deduplication
+        all_hosts = {self.normalize_hostname(h) for h in all_hosts if h}
+        all_hosts = {h for h in all_hosts if self.is_in_scope(h, target)}
+        
+        # Write all.txt
+        all_file = os.path.join(output_dir, 'all.txt')
+        self.write_clean_results(all_hosts, all_file)
+        self.log(f"Unique hosts found: {len(all_hosts)}", "INFO", Colors.GREEN)
+        
+        # Step 7: httpx
+        step = 7
+        result = ToolResult(tool_name='httpx')
+        
+        self.log(f"Starting httpx to identify live hosts...", "INFO", Colors.CYAN)
+        self.update_status_display(step, total_steps, 'HTTPX', result)
+        
+        # Write all hosts to temp file for httpx
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        for host in sorted(all_hosts):
+            temp_file.write(f"{host}\n")
+        temp_file.close()
+        
+        # Build httpx command
+        timeout_seconds = time_minutes * 60
+        cmd = self.build_httpx_command(temp_file.name, threads, time_minutes)
+        httpx_result = self.run_tool('httpx', cmd, timeout_seconds=timeout_seconds)
+        
+        live_urls = set()
+        if httpx_result.raw_output:
+            # httpx outputs URLs directly
+            for line in httpx_result.raw_output.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        parsed = urllib.parse.urlparse(line)
+                        if parsed.scheme in ['http', 'https'] and parsed.hostname:
+                            if self.is_in_scope(parsed.hostname, target):
+                                live_urls.add(line)
+                    except:
+                        pass
+        
+        result.results = self.filter_live_urls(live_urls, target)
+        live_file = os.path.join(output_dir, 'live.txt')
+        self.write_clean_results(result.results, live_file)
+        
+        # Store the result
+        result.raw_output = httpx_result.raw_output
+        result.stderr = httpx_result.stderr
+        result.elapsed_time = httpx_result.elapsed_time
+        result.status = httpx_result.status
+        result.timed_out = httpx_result.timed_out
+        result.exit_code = httpx_result.exit_code
+        
+        tool_results['httpx'] = result
+        self.update_status_display(step, total_steps, 'HTTPX', result)
+        self.log(f"Live hosts found: {len(result.results)}", "INFO", Colors.GREEN)
+        
+        # Clean up temp file
+        try:
+            os.unlink(temp_file.name)
+        except:
+            pass
+        
+        # Step 8: Gowitness
+        step = 8
+        result = ToolResult(tool_name='Gowitness')
+        
+        if len(live_urls) > 0:
+            self.log(f"Starting Gowitness to capture screenshots...", "INFO", Colors.CYAN)
+            self.update_status_display(step, total_steps, 'GOWITNESS', result)
             
-            if self.config.use_async:
-                http_results = await self.check_http_async(list(self.results['valid_dns']))
-            else:
-                # Sync HTTP check
-                http_results = self._check_http_sync(list(self.results['valid_dns']))
+            # Use live.txt as input
+            cmd = self.build_gowitness_command(live_file, threads)
+            # NO TIMEOUT for Gowitness - runs naturally
+            gowitness_result = self.run_tool('Gowitness', cmd, timeout_seconds=None)
             
-            # Filter active
-            active = [r for r in http_results if r.get('is_active', False)]
-            self.results['http_results'] = http_results
+            result.status = gowitness_result.status
+            result.elapsed_time = gowitness_result.elapsed_time
+            result.exit_code = gowitness_result.exit_code
+            result.stderr = gowitness_result.stderr
             
-            # Save detailed results
-            self._save_enhanced_results(http_results)
-            
-            # Summary
-            print(f"\n{Fore.GREEN}{'='*60}")
-            print(f"{Fore.GREEN}✅ SCAN COMPLETE!")
-            print(f"{Fore.GREEN}{'='*60}")
-            print(f"📊 Final Statistics:")
-            print(f"   Total found: {len(self.results['all_subdomains'])}")
-            print(f"   Valid DNS: {len(self.results['valid_dns'])}")
-            print(f"   HTTP/HTTPS alive: {len(active)}")
-            print(f"   Total checked: {len(http_results)}")
-            
-            # DNS stats
-            dns_stats = self.results['stats'].get('dns', {})
-            if dns_stats:
-                print(f"   DNS queries: {dns_stats.get('total', 0)}")
-                print(f"   DNS valid: {dns_stats.get('valid', 0)}")
-            
-            print(f"\n📁 Output files:")
-            print(f"   - subs.txt (all subdomains) - {len(self.results['all_subdomains'])}")
-            print(f"   - final.txt (detailed results) - {len(http_results)}")
-            print(f"   - active.txt (active HTTP/HTTPS) - {len(active)}")
-            print(f"   - results.json (JSON format) - {len(http_results)}")
-            
-            # Total time
-            elapsed = time.time() - self.start_time
-            print(f"\n⏱️  Total scan time: {elapsed:.2f} seconds")
-            print(f"{Fore.GREEN}{'='*60}")
+            tool_results['Gowitness'] = result
+            self.update_status_display(step, total_steps, 'GOWITNESS', result)
+            self.log(f"Screenshots captured: {len(live_urls)}", "INFO", Colors.GREEN)
         else:
-            print(f"{Fore.RED}✗ No valid DNS records found")
-            sys.exit(1)
-
-def create_default_wordlist_enhanced() -> str:
-    """Create enhanced default wordlist"""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    wordlist_path = os.path.join(base_dir, "wordlist.txt")
-    
-    if os.path.exists(wordlist_path) and os.path.getsize(wordlist_path) > 100:
-        return wordlist_path
-    
-    print(f"{Fore.CYAN}[+] Creating enhanced default wordlist...")
-    
-    # Comprehensive wordlist
-    common_words = [
-        # Basic
-        "www", "mail", "ftp", "localhost", "webmail", "smtp", "pop", "ns1", "webdisk",
-        "ns2", "cpanel", "whm", "autodiscover", "autoconfig", "m", "imap", "test",
-        "ns", "blog", "pop3", "dev", "www2", "admin", "forum", "news", "vpn", "ns3",
+            result.status = "skipped"
+            tool_results['Gowitness'] = result
+            self.update_status_display(step, total_steps, 'GOWITNESS', result)
+            self.log("Gowitness skipped - no live URLs found", "INFO", Colors.YELLOW)
         
-        # Services
-        "mail2", "new", "mysql", "old", "lists", "support", "mobile", "mx", "static",
-        "docs", "beta", "shop", "sql", "secure", "demo", "cp", "calendar", "wiki",
-        "web", "media", "email", "images", "img", "www1", "intranet", "portal",
-        "video", "sip", "dns2", "api", "cdn", "stats", "dns1", "ns4", "www3",
-        
-        # Development
-        "dns", "search", "ftp2", "test2", "xmpp", "mx1", "mail1", "webmail2",
-        "mssql", "telnet", "remote", "ssh", "git", "crm", "erp", "jenkins", "jira",
-        "confluence", "bitbucket", "gitlab", "sonar", "nexus", "artifactory",
-        
-        # Security
-        "firewall", "proxy", "vpn", "radius", "ldap", "samba", "ntp",
-        "syslog", "snmp", "sftp", "scp", "rdp", "vnc", "xen", "kvm",
-        
-        # Cloud & Infrastructure
-        "aws", "azure", "gcp", "cloud", "container", "docker", "k8s", "kubernetes",
-        "openshift", "elastic", "kibana", "grafana", "prometheus", "monitoring",
-        "logging", "backup", "restore", "archive", "storage", "database", "db",
-        "redis", "memcached", "mongodb", "postgres", "mysql", "mariadb",
-        
-        # Additional
-        "stage", "staging", "prod", "production", "qa", "quality", "uat", "testing",
-        "sandbox", "playground", "demo", "trial", "test", "dev", "develop", "development",
-        "dashboard", "panel", "control", "manage", "manager", "management",
-        "status", "health", "metrics", "analytics", "reports", "reporting"
-    ]
-    
-    with open(wordlist_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(common_words))
-    
-    print(f"{Fore.GREEN}✓ Wordlist created: {wordlist_path} ({len(common_words)} words)")
-    return wordlist_path
-
-async def merge_wordlists_async(wordlists: List[str]) -> Optional[str]:
-    """Async merge multiple wordlists"""
-    print(f"{Fore.CYAN}[+] Merging {len(wordlists)} wordlists...")
-    
-    all_words = set()
-    for wl in wordlists:
-        try:
-            if wl.startswith(('http://', 'https://')):
-                # Download from URL
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
-                print(f"{Fore.YELLOW}   Downloading: {wl}")
-                urllib.request.urlretrieve(wl, temp_file.name)
-                wl = temp_file.name
+        # Write individual tool files if in 'all' mode
+        if output_mode == 'all':
+            for tool_name, tool_result in tool_results.items():
+                if tool_name in ['Amass', 'Subfinder', 'Assetfinder', 'Sublist3r', 'dnscan']:
+                    filename = os.path.join(output_dir, f"{tool_name.lower()}.txt")
+                    self.write_clean_results(tool_result.results, filename)
             
-            with open(wl, 'r', encoding='utf-8', errors='ignore') as f:
-                words = [line.strip().lower() for line in f if line.strip()]
-                all_words.update(words)
-                print(f"{Fore.GREEN}   ✓ Added {len(words)} words from {os.path.basename(wl)}")
-                
-        except Exception as e:
-            print(f"{Fore.RED}   ✗ Error: {e}")
-    
-    if all_words:
-        merged_path = tempfile.NamedTemporaryFile(delete=False, suffix='.txt').name
-        with open(merged_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(sorted(all_words)))
-        print(f"{Fore.GREEN}✓ Merged {len(all_words)} unique words")
-        return merged_path
-    
-    return None
+            # Write logs
+            logs_dir = os.path.join(output_dir, 'logs')
+            for tool_name, tool_result in tool_results.items():
+                if tool_result.raw_output:
+                    log_file = os.path.join(logs_dir, f"{tool_name.lower()}.log")
+                    with open(log_file, 'w') as f:
+                        f.write(tool_result.raw_output)
+                        if tool_result.stderr:
+                            f.write("\n\n--- STDERR ---\n")
+                            f.write(tool_result.stderr)
+        
+        # Display final summary
+        self.display_summary(target, output_dir, all_hosts, live_urls, tool_results)
 
-def check_required_tools():
-    """Check if required tools are installed"""
-    print(f"{Fore.CYAN}[+] Checking required tools...")
-    
-    tools = {
-        'subfinder': 'subfinder -version',
-        'assetfinder': 'assetfinder --help',
-        'amass': 'amass -version',
-        'go': 'go version'  # Needed for installing tools
-    }
-    
-    installed = []
-    missing = []
-    
-    for tool, cmd in tools.items():
-        try:
-            subprocess.run(cmd.split(), capture_output=True, check=True)
-            print(f"{Fore.GREEN}   ✓ {tool}")
-            installed.append(tool)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print(f"{Fore.RED}   ✗ {tool}")
-            missing.append(tool)
-    
-    # Check Sublist3r separately
-    try:
-        import sublist3r
-        print(f"{Fore.GREEN}   ✓ sublist3r")
-        installed.append('sublist3r')
-    except ImportError:
-        print(f"{Fore.RED}   ✗ sublist3r")
-        missing.append('sublist3r')
-    
-    return installed, missing
+    def display_summary(self, target: str, output_dir: str, all_hosts: Set[str], 
+                        live_urls: Set[str], tool_results: Dict[str, ToolResult]):
+        """Display the final summary"""
+        summary = f"""
+{Colors.BOLD}{Colors.CYAN}============================================
+                    SIATK SUMMARY
+============================================{Colors.RESET}
 
-def install_missing_tools(missing: List[str]):
-    """Install missing tools"""
-    if not missing:
-        return
-    
-    print(f"\n{Fore.YELLOW}[+] Installing missing tools: {', '.join(missing)}")
-    
-    install_commands = {
-        'subfinder': 'go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest',
-        'assetfinder': 'go install github.com/tomnomnom/assetfinder@latest',
-        'amass': 'go install -v github.com/owasp-amass/amass/v4/...@master',
-        'sublist3r': 'pip install sublist3r'
-    }
-    
-    for tool in missing:
-        if tool in install_commands:
-            print(f"{Fore.CYAN}   Installing {tool}...")
-            try:
-                subprocess.run(install_commands[tool], shell=True, check=True)
-                print(f"{Fore.GREEN}   ✓ {tool} installed")
-            except Exception as e:
-                print(f"{Fore.RED}   ✗ Failed to install {tool}: {e}")
+{Colors.BOLD}Target:{Colors.RESET} {target}
 
-def print_banner():
-    """Print beautiful banner"""
-    banner = f"""
-{Fore.CYAN}╔═══════════════════════════════════════════════════════════════╗
-{Fore.CYAN}║                                                               ║
-{Fore.CYAN}║     {Style.BRIGHT}🚀 Subdomain Scanner v3.0 - Professional{Fore.CYAN}             ║
-{Fore.CYAN}║     {Style.DIM}Advanced Multi-Threaded Subdomain Discovery{Fore.CYAN}              ║
-{Fore.CYAN}║     {Style.DIM}DNS + HTTP Validation + Async Processing{Fore.CYAN}                ║
-{Fore.CYAN}║                                                               ║
-{Fore.CYAN}║     {Fore.GREEN}Tools:{Fore.CYAN} Subfinder | Sublist3r | Assetfinder | Amass     ║
-{Fore.CYAN}║     {Fore.YELLOW}Features:{Fore.CYAN} DNS Validation | HTTP Check | Tech Detection ║
-{Fore.CYAN}║                                                               ║
-{Fore.CYAN}╚═══════════════════════════════════════════════════════════════╝
-{Fore.RESET}
 """
-    print(banner)
+        # Tool results
+        for tool_name in ['Amass', 'Subfinder', 'Assetfinder', 'Sublist3r', 'dnscan']:
+            if tool_name in tool_results:
+                result = tool_results[tool_name]
+                count = len(result.results)
+                status = result.status
+                status_color = Colors.GREEN if status == 'done' else Colors.YELLOW if status == 'timeout' else Colors.RED
+                summary += f"{Colors.BOLD}{tool_name}:{Colors.RESET} {status_color}{count:>6}{Colors.RESET} ({status})\n"
+        
+        summary += f"""
+{Colors.BOLD}Unique hosts:{Colors.RESET} {Colors.GREEN}{len(all_hosts):>6}{Colors.RESET}
+{Colors.BOLD}Live hosts:{Colors.RESET}   {Colors.GREEN}{len(live_urls):>6}{Colors.RESET}
+{Colors.BOLD}Screenshots:{Colors.RESET}  {Colors.GREEN}{len(live_urls):>6}{Colors.RESET}
 
-def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully"""
-    print(f"\n{Fore.YELLOW}⚠️  Scan interrupted by user")
-    print(f"{Fore.CYAN}Exiting gracefully...")
-    sys.exit(0)
+{Colors.BOLD}Output:{Colors.RESET}
+    {output_dir}
+
+{Colors.BOLD}Status:{Colors.RESET} {Colors.GREEN}COMPLETED{Colors.RESET}
+{Colors.CYAN}============================================{Colors.RESET}
+"""
+        print(summary)
+
+    def main(self):
+        """Main entry point"""
+        # Parse arguments
+        parser = argparse.ArgumentParser(
+            description='SIATK - Subdomain Intelligence & Asset Toolkit',
+            add_help=False
+        )
+        parser.add_argument('-u', '--url', help='Target root domain')
+        parser.add_argument('-w', '--wordlist', help='Wordlist for dnscan only')
+        parser.add_argument('-t', '--threads', type=int, default=10, help='Number of threads')
+        parser.add_argument('-o', '--output', choices=['combined', 'all'], default='combined', 
+                           help='Output mode: combined or all')
+        parser.add_argument('--time-minutes', type=int, default=10, help='Maximum runtime in minutes')
+        parser.add_argument('-h', '--help', action='store_true', help='Show help message')
+        
+        try:
+            args = parser.parse_args()
+        except SystemExit:
+            self.print_help()
+            return 0
+        
+        if args.help:
+            self.print_help()
+            return 0
+            
+        if not args.url:
+            self.log("Error: Target URL (-u) is required", "ERROR", Colors.RED)
+            self.print_help()
+            return 1
+        
+        # Validate arguments
+        if args.threads < 1:
+            self.log("Error: Threads must be >= 1", "ERROR", Colors.RED)
+            return 1
+            
+        if args.time_minutes < 1:
+            self.log("Error: Time-minutes must be >= 1", "ERROR", Colors.RED)
+            return 1
+        
+        # Normalize target
+        target = self.normalize_target(args.url)
+        
+        if not self.validate_target(target):
+            self.log(f"Error: Invalid target domain: {target}", "ERROR", Colors.RED)
+            return 1
+            
+        # Validate wordlist if provided
+        if args.wordlist:
+            if not os.path.exists(args.wordlist):
+                self.log(f"Error: Wordlist file not found: {args.wordlist}", "ERROR", Colors.RED)
+                return 1
+            if not os.access(args.wordlist, os.R_OK):
+                self.log(f"Error: Wordlist file not readable: {args.wordlist}", "ERROR", Colors.RED)
+                return 1
+        
+        # Preflight check for required tools
+        if not self.preflight_check():
+            return 1
+            
+        # Setup configuration
+        self.config.target = target
+        self.config.wordlist = args.wordlist
+        self.config.threads = args.threads
+        self.config.output_mode = args.output
+        self.config.time_minutes = args.time_minutes
+        
+        # Create output directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.config.timestamp = timestamp
+        output_dir_name = f"{target}_{timestamp}"
+        self.config.output_dir = os.path.join('output', output_dir_name)
+        
+        try:
+            # Run the pipeline
+            self.run_pipeline()
+        except KeyboardInterrupt:
+            self.log("\nInterrupted by user. Cleaning up...", "WARNING", Colors.YELLOW)
+            # Kill all running processes
+            for process in self.running_processes:
+                self.kill_process_group(process)
+            self.log("Cleanup complete.", "INFO", Colors.GREEN)
+            return 130
+        except Exception as e:
+            self.log(f"Unexpected error: {str(e)}", "ERROR", Colors.RED)
+            return 1
+            
+        return 0
 
 def main():
-    """Main function"""
-    # Set up signal handler
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    # Print banner
-    print_banner()
-    
-    # Parse arguments
-    parser = argparse.ArgumentParser(
-        description='Advanced Subdomain Scanner v3.0 - Professional Discovery Tool',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"""
-{Fore.CYAN}═══════════════════════════════════════════════════════════════════
-{Fore.CYAN}📖 EXAMPLES:
-{Fore.CYAN}═══════════════════════════════════════════════════════════════════
-
-{Fore.GREEN}Basic Usage:
-{Fore.YELLOW}  subdomain-scanner example.com
-
-{Fore.GREEN}With Custom Wordlist:
-{Fore.YELLOW}  subdomain-scanner example.com -w /path/to/wordlist.txt
-
-{Fore.GREEN}With Multiple Wordlists:
-{Fore.YELLOW}  subdomain-scanner example.com -w wl1.txt,wl2.txt,wl3.txt
-
-{Fore.GREEN}With Popular Wordlists:
-{Fore.YELLOW}  subdomain-scanner example.com --use-seclists
-{Fore.YELLOW}  subdomain-scanner example.com --use-all
-
-{Fore.GREEN}Performance Tuning:
-{Fore.YELLOW}  subdomain-scanner example.com --max-workers 100 --timeout 10
-
-{Fore.GREEN}Passive Mode (No Wordlist):
-{Fore.YELLOW}  subdomain-scanner example.com --no-wordlist
-
-{Fore.GREEN}Verbose Debug:
-{Fore.YELLOW}  subdomain-scanner example.com --verbose
-
-{Fore.CYAN}═══════════════════════════════════════════════════════════════════
-{Fore.CYAN}📁 OUTPUT FILES:
-{Fore.CYAN}═══════════════════════════════════════════════════════════════════
-{Fore.YELLOW}  subs.txt     {Fore.WHITE}- All discovered subdomains
-{Fore.YELLOW}  final.txt    {Fore.WHITE}- Detailed results with status, title, tech
-{Fore.YELLOW}  active.txt   {Fore.WHITE}- Active HTTP/HTTPS subdomains only
-{Fore.YELLOW}  results.json {Fore.WHITE}- JSON format for automation
-
-{Fore.CYAN}═══════════════════════════════════════════════════════════════════
-{Fore.CYAN}🔧 TROUBLESHOOTING:
-{Fore.CYAN}═══════════════════════════════════════════════════════════════════
-{Fore.YELLOW}  If tools are missing: {Fore.WHITE}The script will attempt to install them
-{Fore.YELLOW}  If scan is slow: {Fore.WHITE}Try --max-workers 20 --timeout 15
-{Fore.YELLOW}  If scan hangs: {Fore.WHITE}Try --no-async
-{Fore.YELLOW}  For more help: {Fore.WHITE}subdomain-scanner -h
-{Fore.RESET}
-"""
-    )
-    
-    parser.add_argument('domain', help='Target domain to scan')
-    parser.add_argument('-w', '--wordlist', help='Wordlist file(s) - separate with commas, supports URLs')
-    parser.add_argument('--use-seclists', action='store_true', help='Download and use SecLists wordlist')
-    parser.add_argument('--use-all', action='store_true', help='Download and use all popular wordlists')
-    parser.add_argument('--no-wordlist', action='store_true', help='Disable wordlist (passive mode only)')
-    parser.add_argument('--max-workers', type=int, default=50, help='Maximum concurrent workers (default: 50)')
-    parser.add_argument('--timeout', type=int, default=8, help='HTTP timeout in seconds (default: 8)')
-    parser.add_argument('--dns-timeout', type=int, default=5, help='DNS timeout in seconds (default: 5)')
-    parser.add_argument('--no-async', action='store_true', help='Disable async processing')
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--output-dir', default='.', help='Output directory (default: current)')
-    parser.add_argument('--version', action='version', version='Subdomain Scanner v3.0')
-    parser.add_argument('--no-progress', action='store_true', help='Disable progress bar')
-    
-    args = parser.parse_args()
-    
-    # Check and install tools
-    installed, missing = check_required_tools()
-    if missing:
-        install_missing_tools(missing)
-    
-    # Config
-    config = ScanConfig(
-        max_workers=args.max_workers,
-        dns_timeout=args.dns_timeout,
-        http_timeout=args.timeout,
-        use_async=not args.no_async,
-        verbose=args.verbose,
-        output_dir=args.output_dir,
-        show_progress=not args.no_progress
-    )
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Wordlist handling
-    wordlist_path = None
-    if not args.no_wordlist:
-        wordlist_path = create_default_wordlist_enhanced()
-        
-        if args.wordlist:
-            # Handle multiple wordlists
-            wordlists = args.wordlist.split(',')
-            if len(wordlists) > 1:
-                # Merge wordlists asynchronously
-                try:
-                    merged = asyncio.run(merge_wordlists_async(wordlists))
-                    if merged:
-                        wordlist_path = merged
-                except Exception as e:
-                    print(f"{Fore.RED}Error merging wordlists: {e}")
-            else:
-                wordlist_path = wordlists[0]
-                
-                # If URL, download it
-                if wordlist_path.startswith(('http://', 'https://')):
-                    try:
-                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
-                        print(f"{Fore.YELLOW}Downloading wordlist from: {wordlist_path}")
-                        urllib.request.urlretrieve(wordlist_path, temp_file.name)
-                        wordlist_path = temp_file.name
-                        print(f"{Fore.GREEN}✓ Downloaded to: {wordlist_path}")
-                    except Exception as e:
-                        print(f"{Fore.RED}✗ Failed to download wordlist: {e}")
-                        wordlist_path = create_default_wordlist_enhanced()
-        
-        # Add popular wordlists
-        if args.use_seclists or args.use_all:
-            sources = []
-            if args.use_seclists:
-                sources.append(POPULAR_WORDLISTS['seclists'])
-            if args.use_all:
-                sources.extend(list(POPULAR_WORDLISTS.values()))
-            
-            if sources:
-                try:
-                    merged = asyncio.run(merge_wordlists_async(sources))
-                    if merged:
-                        wordlist_path = merged
-                except Exception as e:
-                    print(f"{Fore.RED}Error merging popular wordlists: {e}")
-    
-    # Scanner
-    scanner = SubdomainScanner(args.domain, config)
-    
-    # Run scan
+    """Entry point"""
+    app = SIATK()
     try:
-        asyncio.run(scanner.run_full_scan(wordlist_path))
+        sys.exit(app.main())
     except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}⚠️  Scan interrupted")
-        sys.exit(0)
-    except Exception as e:
-        print(f"{Fore.RED}✗ Unexpected error: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+        sys.exit(130)
 
 if __name__ == "__main__":
     main()
