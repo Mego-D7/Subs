@@ -367,7 +367,7 @@ class SIATK:
             'scan',
             'file',
             '-f', url_file,
-            '--screenshot-path', 'screenshots/',
+            '--screenshot-path', './screenshots/',
             '--threads', str(min(threads, 20))
         ]
 
