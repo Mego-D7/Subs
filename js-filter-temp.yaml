@@ -1,0 +1,395 @@
+id: js-interesting-patterns
+
+info:
+  name: JavaScript Interesting Security Patterns
+  author: magdy
+  severity: info
+  description: Detects potentially interesting JavaScript security-related patterns in JavaScript responses.
+  tags: javascript,js,security,dom-xss,prototype-pollution,interesting
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}"
+
+    headers:
+      Accept: "*/*"
+      User-Agent: Mozilla/5.0
+
+    matchers:
+      - type: word
+        part: body
+        condition: or
+        words:
+
+          # JavaScript execution
+          - "eval("
+          - "window.eval"
+          - "Function("
+          - "new Function"
+          - "execScript("
+          - "setTimeout("
+          - "setInterval("
+          - "setImmediate("
+          - "msSetImmediate("
+          - "execCommand("
+
+          # DOM XSS sinks
+          - "innerHTML"
+          - "outerHTML"
+          - "insertAdjacentHTML"
+          - "document.write"
+          - "document.writeln"
+          - "createContextualFragment"
+          - "range.createContextualFragment"
+          - "srcdoc"
+          - "iframe.srcdoc"
+          - "script.src"
+          - "script.textContent"
+          - "script.innerHTML"
+          - "script.innerText"
+
+          # DOM manipulation
+          - "createElement("
+          - "createTextNode("
+          - "createDocumentFragment("
+          - "appendChild("
+          - "insertBefore("
+          - "setAttribute("
+          - "dangerouslySetInnerHTML"
+          - "DOMParser"
+          - "parseFromString("
+
+          # DOM sources
+          - "location"
+          - "location.href"
+          - "location.hash"
+          - "location.search"
+          - "location.pathname"
+          - "location.host"
+          - "location.hostname"
+          - "location.protocol"
+          - "document.URL"
+          - "document.documentURI"
+          - "document.baseURI"
+          - "document.referrer"
+          - "window.name"
+
+          # Storage
+          - "localStorage"
+          - "localStorage.getItem"
+          - "localStorage.setItem"
+          - "sessionStorage"
+          - "sessionStorage.getItem"
+          - "sessionStorage.setItem"
+          - "indexedDB"
+
+          # URL / redirects
+          - "location.assign"
+          - "location.replace"
+          - "window.open"
+          - "open("
+          - "javascript:"
+          - "redirect"
+          - "redirectUrl"
+          - "redirectURL"
+          - "returnUrl"
+          - "returnURL"
+          - "returnTo"
+          - "return_to"
+          - "nextUrl"
+          - "nextURL"
+
+          # postMessage
+          - "postMessage("
+          - "window.postMessage"
+          - "parent.postMessage"
+          - "top.postMessage"
+          - "MessageEvent"
+          - "event.data"
+          - "event.origin"
+          - "onmessage"
+          - "MessageChannel"
+          - "MessagePort"
+
+          # Network
+          - "fetch("
+          - "XMLHttpRequest"
+          - "XMLHttpRequest.open"
+          - "XMLHttpRequest.send"
+          - "xhr.open"
+          - "xhr.send"
+          - "axios"
+          - "axios.get"
+          - "axios.post"
+          - "axios.put"
+          - "axios.patch"
+          - "axios.delete"
+          - "axios.request"
+          - "jQuery.ajax"
+          - "$.ajax"
+          - "$.get"
+          - "$.post"
+          - "$.getJSON"
+
+          # WebSocket
+          - "WebSocket"
+          - "new WebSocket"
+          - "WebSocket.send"
+
+          # jQuery sinks
+          - "jQuery.globalEval"
+          - "$.globalEval"
+          - "jQuery.parseHTML"
+          - "$.parseHTML"
+          - "jQuery.parseJSON"
+          - "$.parseJSON"
+          - ".append("
+          - ".appendTo("
+          - ".after("
+          - ".before("
+          - ".html("
+          - ".prepend("
+          - ".prependTo("
+          - ".replaceWith("
+          - ".replaceAll("
+          - ".insertAfter("
+          - ".insertBefore("
+          - ".wrap("
+          - ".wrapAll("
+          - ".wrapInner("
+
+          # Prototype Pollution
+          - "__proto__"
+          - "constructor.prototype"
+          - "Object.prototype"
+          - "Object.assign("
+          - "Object.create("
+          - "Object.defineProperty("
+          - "Object.defineProperties("
+          - "Object.getPrototypeOf("
+          - "Object.setPrototypeOf("
+          - "Reflect.setPrototypeOf("
+          - "Reflect.defineProperty("
+          - "merge("
+          - "extend("
+          - "deepMerge("
+          - "deepmerge("
+          - "deepExtend("
+          - "mergeDeep("
+          - "mergeWith("
+          - "defaultsDeep("
+          - "setPath("
+          - "setValue("
+          - "getPath("
+          - "getValue("
+          - "parseQuery("
+          - "querystring.parse"
+          - "URLSearchParams"
+
+          # Node.js / server-side gadgets
+          - "child_process"
+          - "child_process.exec"
+          - "child_process.spawn"
+          - "child_process.execFile"
+          - "child_process.fork"
+          - "execSync("
+          - "spawnSync("
+          - "execFileSync("
+          - "require("
+          - "require.resolve("
+          - "module.exports"
+          - "module.require("
+          - "process.env"
+          - "process.mainModule"
+          - "vm.runInNewContext("
+          - "vm.runInThisContext("
+          - "vm.runInContext("
+          - "vm.Script"
+
+          # File system
+          - "fs.readFile"
+          - "fs.readFileSync"
+          - "fs.writeFile"
+          - "fs.writeFileSync"
+          - "fs.appendFile"
+          - "fs.appendFileSync"
+          - "fs.createReadStream"
+          - "fs.createWriteStream"
+          - "path.join("
+          - "path.resolve("
+          - "path.normalize("
+
+          # SSRF / URL handling
+          - "http.request"
+          - "https.request"
+          - "http.get"
+          - "https.get"
+          - "hostname"
+          - "proxy"
+          - "proxyUrl"
+          - "proxyURL"
+          - "followRedirect"
+          - "followRedirects"
+
+          # Authentication / secrets
+          - "Authorization"
+          - "authorization"
+          - "Bearer"
+          - "access_token"
+          - "accessToken"
+          - "refresh_token"
+          - "refreshToken"
+          - "id_token"
+          - "idToken"
+          - "jwt"
+          - "JWT"
+          - "jwt.decode"
+          - "jwtDecode"
+          - "jwt.verify"
+          - "jwt.sign"
+          - "authToken"
+          - "auth_token"
+          - "sessionId"
+          - "session_id"
+          - "csrfToken"
+          - "csrf_token"
+          - "xsrfToken"
+          - "xsrf_token"
+
+          # API keys / secrets
+          - "apiKey"
+          - "api_key"
+          - "apikey"
+          - "client_secret"
+          - "clientSecret"
+          - "privateKey"
+          - "private_key"
+          - "secretKey"
+          - "secret_key"
+          - "AWS_ACCESS_KEY_ID"
+          - "AWS_SECRET_ACCESS_KEY"
+          - "firebaseConfig"
+          - "google_api_key"
+          - "googleApiKey"
+          - "github_token"
+          - "githubToken"
+
+          # CORS / Origin
+          - "Access-Control-Allow-Origin"
+          - "Access-Control-Allow-Credentials"
+          - "allowOrigin"
+          - "allowedOrigins"
+          - "withCredentials"
+          - "document.domain"
+          - "location.origin"
+          - "window.origin"
+
+          # JSON / parsing
+          - "JSON.parse("
+          - "JSON.stringify("
+          - "RegExp("
+          - "new RegExp("
+          - "document.evaluate("
+
+          # File APIs
+          - "FileReader"
+          - "readAsArrayBuffer"
+          - "readAsBinaryString"
+          - "readAsDataURL"
+          - "readAsText"
+          - "requestFileSystem("
+          - "getFile("
+
+          # Client-side SQL
+          - "openDatabase("
+          - "executeSql("
+          - "transaction.executeSql"
+
+          # Template engines
+          - "Handlebars"
+          - "handlebars"
+          - "Mustache"
+          - "mustache"
+          - "Pug"
+          - "pug"
+          - "EJS"
+          - "lodash.template"
+          - "_.template"
+          - "compile("
+          - "render("
+
+          # Framework-specific
+          - "v-html"
+          - "ng-bind-html"
+          - "ng-bind"
+          - "dangerouslySetInnerHTML"
+
+          # Dynamic loading
+          - "import("
+          - "importScripts("
+          - "System.import"
+          - "loadScript("
+          - "sourceMappingURL"
+          - "sourcemap"
+
+          # GraphQL
+          - "graphql"
+          - "GraphQL"
+          - "GraphQLClient"
+          - "__schema"
+          - "__type"
+          - "introspection"
+          - "operationName"
+          - "/graphql"
+          - "/graphiql"
+
+          # API discovery
+          - "/api/"
+          - "/api/v1"
+          - "/api/v2"
+          - "/api/v3"
+          - "baseURL"
+          - "baseUrl"
+          - "apiURL"
+          - "apiUrl"
+          - "endpoint"
+          - "endpoints"
+          - "swagger"
+          - "openapi"
+          - "swagger.json"
+          - "openapi.json"
+
+          # Crypto / encoding
+          - "atob("
+          - "btoa("
+          - "decodeURIComponent("
+          - "decodeURI("
+          - "encodeURIComponent("
+          - "encodeURI("
+          - "unescape("
+          - "escape("
+          - "crypto.subtle"
+          - "SubtleCrypto"
+          - "decrypt("
+          - "encrypt("
+          - "importKey("
+          - "verify("
+          - "sign("
+
+          # Service workers / workers
+          - "serviceWorker"
+          - "navigator.serviceWorker"
+          - "new Worker("
+          - "new SharedWorker("
+          - "Worker("
+          - "SharedWorker("
+          - "ServiceWorker"
+          - "importScripts("
+
+    extractors:
+      - type: regex
+        name: interesting-pattern
+        part: body
+        regex:
+          - '(?i)(eval\s*\(|innerHTML|outerHTML|insertAdjacentHTML|document\.write|document\.writeln|__proto__|constructor\.prototype|postMessage\s*\(|WebSocket|localStorage|sessionStorage|document\.cookie|location\.hash|location\.search|fetch\s*\(|XMLHttpRequest|child_process|process\.env|require\s*\()'
